@@ -24,8 +24,8 @@ on:
         required: false
 
 env:
-  # oldest Gotify release the plugin builds for (Go 1.24, plugin-api v1.0.0)
-  MIN_GOTIFY: v2.6.0
+  # oldest Gotify release the plugin builds for (first one built with Go 1.24, which the dependencies need)
+  MIN_GOTIFY: v2.6.2
 
 jobs:
   test:
