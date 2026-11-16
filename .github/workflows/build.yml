@@ -1,0 +1,91 @@
+# Tests, then builds the plugin for each supported Gotify release and
+# architecture. A Go plugin only loads into the exact server release it was
+# built for, so every .so is named after its Gotify version.
+# A tag v* creates a GitHub release with all builds attached.
+
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      gotify:
+        description: 'Gotify release to build for (e.g. v3.1.1); empty = the list below'
+        required: false
+
+env:
+  # Gotify releases to build for by default (newest first)
+  GOTIFY_VERSIONS: '["v3.1.1"]'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  versions:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.v.outputs.list }}
+    steps:
+      - id: v
+        run: |
+          if [ -n "${{ github.event.inputs.gotify }}" ]; then
+            echo 'list=["${{ github.event.inputs.gotify }}"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "list=$GOTIFY_VERSIONS" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: [test, versions]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        gotify: ${{ fromJSON(needs.versions.outputs.list) }}
+        arch: [linux-amd64, linux-arm64, linux-arm-7]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          case "$GITHUB_REF" in refs/tags/v*) ;; *) v="$(git describe --tags --always)";; esac
+          make build GOTIFY_VERSION=${{ matrix.gotify }} ARCHS=${{ matrix.arch }} VERSION="$v"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phonelink-${{ matrix.gotify }}-${{ matrix.arch }}
+          path: dist/*.so
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: phonelink-*
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum *.so > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.so
+            dist/SHA256SUMS
+          generate_release_notes: true
