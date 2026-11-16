@@ -190,6 +190,28 @@ func (i *Instance) GetDisplay(location *url.URL) string {
 	}
 	fmt.Fprintf(&b, "- Senders: %s\n", strings.Join(names, ", "))
 	fmt.Fprintf(&b, "- Linked users: %d\n", linked)
+	h.mu.Lock()
+	waiting := 0
+	for _, a := range h.approvals {
+		if a.decided == "" {
+			waiting++
+		}
+	}
+	mods := h.moderatorsLocked(cfg)
+	h.mu.Unlock()
+	modNames := make([]string, 0, len(mods))
+	for _, m := range mods {
+		modNames = append(modNames, m.user.Name)
+	}
+	fmt.Fprintf(&b, "- Moderators: %s; waiting for approval: %d\n", strings.Join(modNames, ", "), waiting)
+	mailMu.Lock()
+	gate := h.mail
+	mailMu.Unlock()
+	if gate != nil {
+		fmt.Fprintf(&b, "- Mail gate: listening on `%s`, relaying to `%s`\n", gate.cfg.Listen, gate.cfg.Relay)
+	} else if cfg.Mail.enabled() {
+		fmt.Fprintf(&b, "- Mail gate: **not running** (see the Gotify log)\n")
+	}
 	return b.String()
 }
 

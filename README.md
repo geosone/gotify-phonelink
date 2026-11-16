@@ -65,7 +65,8 @@ senders:
     failover: 2m                  # SMS if not opened within 2 minutes
     failover_max: 5m              # upper limit for a per-message failover
     sms: true
-    sms_unlinked: true            # unlinked numbers get an SMS at once
+    sms_unlinked: true            # unlinked numbers get an SMS ...
+    approval: true                # ... once a moderator approved it
     hide_content: true            # push shows only "tap to view"
   - name: zabbix
     token: ...
@@ -109,6 +110,54 @@ Each user enables the plugin and follows *Link phone number* on the plugin
 page. Disabling the plugin stops pushes to that account (senders with
 `sms_unlinked` then use SMS).
 
+## Moderator approval
+
+Senders with `approval: true` (and `sms_unlinked: true`) do not send an SMS to
+a number no Gotify user linked right away: the moderators (`moderators`, or
+all Gotify administrators) get a push with a review link and the SMS goes out
+only when one of them approves it. A newer message to the same number (a new
+code) replaces the waiting one. A request with `requester` set (the sender
+vouches that a logged-in user asked, as ma1sd does for identity server v2
+requests) needs no approval. Requests expire after `approval_timeout`
+(default 24h). With `sms.allowed_prefixes` (e.g. `["+43"]`) SMS to other
+numbers are refused at once.
+
+For a Matrix server with open registration this means nobody gets a code (and
+nobody can finish registering) before a moderator agreed - and nobody can make
+the server send SMS to arbitrary numbers.
+
+## Mail gate
+
+The plugin can also stand between Synapse and the mail server: Synapse sends
+its mail to the gate, which relays it unchanged - except mails containing one
+of `hold_patterns` (default: the link of a registration e-mail,
+`/registration/email/submit_token`), which wait for a moderator like SMS.
+
+```yaml
+mail:
+  listen: ":2525"
+  allowed_clients: [192.0.2.10]          # the Synapse host
+  tls_cert: /etc/ssl/gotify.fullchain    # STARTTLS, read on every connection
+  tls_key: /etc/ssl/gotify.key
+  relay: mail.example.org:587
+  relay_starttls: true
+  relay_username: ""
+  relay_password: ""
+  sender: synapse                        # name shown to moderators
+  approval_timeout: 24h
+```
+
+Synapse:
+
+```yaml
+email:
+  smtp_host: gotify.example.org
+  smtp_port: 2525
+  require_transport_security: true
+```
+
+If Gotify is down, Synapse cannot send mail.
+
 ## Send
 
 ```sh
@@ -126,6 +175,7 @@ curl -X POST https://gotify.example.org/plugin/<id>/custom/<token>/send \
 | `priority`     | Gotify priority (default 5)                                    |
 | `failover`     | seconds or a duration (`"2m"`, `0` = none), capped at `failover_max` |
 | `hide_content` | push only "tap to view"                                        |
+| `requester`    | who asked the sender (e.g. a logged-in Matrix ID): no approval |
 
 Answers: `200 {"status":"push","id":"…","failover_in":"2m0s"}`,
 `200 {"status":"sms"}`, `404` recipient not linked, `409` number linked to

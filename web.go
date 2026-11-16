@@ -72,7 +72,9 @@ func (i *Instance) routes(g *gin.RouterGroup) {
 	// control instance endpoints
 	g.GET("oidc/callback", i.handleCallback)
 	g.POST("send", i.handleSend)
-	g.GET("m/:msg", i.handleOpen) // not :id - gotify mounts plugins under /plugin/:id/
+	g.GET("m/:msg", i.handleOpen)
+	g.GET("approve/:req", i.handleReview)
+	g.POST("approve/:req", i.handleDecide) // not :id - gotify mounts plugins under /plugin/:id/
 }
 
 func (i *Instance) handleLink(c *gin.Context) {
@@ -213,4 +215,70 @@ func (i *Instance) handleOpen(c *gin.Context) {
 		note = "\n\n(It was also sent by SMS because it was not opened in time.)"
 	}
 	render(c, http.StatusOK, pageData{Title: title, Text: d.message + note})
+}
+
+var reviewPage = template.Must(template.New("review").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>Approval</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:32rem;margin:2rem auto;padding:0 1rem;color:#222;background:#fafafa}
+h1{font-size:1.3rem} .box{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1rem 1.2rem}
+dt{font-weight:600;margin-top:.5rem} dd{margin:0;word-break:break-all} .err{color:#a00}
+button{font-size:1.1rem;padding:.5rem 1.2rem;margin:.8rem .5rem 0 0;border-radius:6px;border:1px solid #888}
+.ok{background:#2e7d32;color:#fff;border-color:#2e7d32} .no{background:#fff;color:#a00;border-color:#a00}
+@media (prefers-color-scheme: dark){body{background:#1e1e1e;color:#eee}.box{background:#2a2a2a;border-color:#444}.no{background:#2a2a2a}}
+</style></head><body><h1>{{if eq .Kind "sms"}}SMS{{else}}E-mail{{end}} from {{.Sender}}</h1>
+<div class="box"><dl>
+<dt>To</dt><dd>{{.To}}</dd>
+<dt>Requested</dt><dd>{{.Created.Format "2006-01-02 15:04:05"}}</dd>
+{{if .Decided}}<dt>Decision</dt><dd>{{.Decided}}{{if .DecidedBy}} by {{.DecidedBy}}{{end}}</dd>
+{{if .Error}}<dd class="err">Delivery failed: {{.Error}}</dd>{{end}}
+{{else}}<dt>Expires</dt><dd>{{.Expires.Format "2006-01-02 15:04:05"}}</dd>{{end}}
+</dl>
+{{if not .Decided}}<form method="post">
+<button class="ok" type="submit" name="decision" value="approve">Approve</button>
+<button class="no" type="submit" name="decision" value="reject">Reject</button>
+</form>{{end}}
+</div></body></html>`))
+
+func (i *Instance) renderReview(c *gin.Context, v *approvalView) {
+	c.Header("Cache-Control", "no-store")
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.Status(http.StatusOK)
+	if err := reviewPage.Execute(c.Writer, v); err != nil {
+		log.Printf("gotify-phonelink: render: %v", err)
+	}
+}
+
+// handleReview shows a held message; deciding needs a POST, so link
+// previews cannot approve anything.
+func (i *Instance) handleReview(c *gin.Context) {
+	if !i.isControl() {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	v, ok := i.h.reviewable(c.Param("req"), c.Query("m"), c.Query("k"))
+	if !ok {
+		i.fail(c, http.StatusNotFound, errors.New("this request is unknown or expired"))
+		return
+	}
+	i.renderReview(c, v)
+}
+
+func (i *Instance) handleDecide(c *gin.Context) {
+	if !i.isControl() {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	d := c.PostForm("decision")
+	if d != "approve" && d != "reject" {
+		i.fail(c, http.StatusBadRequest, errors.New("unknown decision"))
+		return
+	}
+	v, err := i.h.decide(c.Request.Context(), c.Param("req"), c.Query("m"), c.Query("k"), d == "approve")
+	if err != nil {
+		i.fail(c, http.StatusNotFound, err)
+		return
+	}
+	i.renderReview(c, v)
 }

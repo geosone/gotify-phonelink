@@ -17,6 +17,11 @@ type Config struct {
 	OIDC      OIDCConfig     `yaml:"oidc"`
 	SMS       SMSConfig      `yaml:"sms"`
 	Senders   []SenderConfig `yaml:"senders"`
+	// Gotify users who approve messages to unknown recipients (senders with
+	// approval: true); empty = all administrators
+	Moderators []string `yaml:"moderators"`
+	// SMTP gate for Synapse mail (see mail.go)
+	Mail MailConfig `yaml:"mail"`
 }
 
 // OIDCConfig is the OpenID Connect provider the phone numbers come from. It
@@ -48,6 +53,8 @@ type SMSConfig struct {
 	Timeout  string `yaml:"timeout"`
 	// Send a code to the number when linking; only a confirmed number is linked
 	VerifyOnLink bool `yaml:"verify_on_link"`
+	// SMS only to numbers starting with one of these (e.g. ["+43"]); empty = all
+	AllowedPrefixes []string `yaml:"allowed_prefixes"`
 }
 
 // SenderConfig is a client allowed to POST to the send endpoint.
@@ -66,15 +73,20 @@ type SenderConfig struct {
 	SMSMinPriority int `yaml:"sms_min_priority"`
 	// Push only "tap to view"; the text is shown on the plugin page (for codes)
 	HideContent bool `yaml:"hide_content"`
+	// SMS to unlinked numbers (sms_unlinked) wait until a moderator approves them
+	Approval bool `yaml:"approval"`
+	// How long a request waits for a moderator (default 24h)
+	ApprovalTimeout string `yaml:"approval_timeout"`
 }
 
 // UserConfig is the (empty) configuration of non-administrators.
 type UserConfig struct{}
 
 const (
-	defaultUsernameClaim = "preferred_username"
-	defaultSMSTimeout    = 30 * time.Second
-	minTokenLength       = 16
+	defaultUsernameClaim   = "preferred_username"
+	defaultSMSTimeout      = 30 * time.Second
+	minTokenLength         = 16
+	defaultApprovalTimeout = 24 * time.Hour
 )
 
 func defaultConfig() *Config {
@@ -163,6 +175,14 @@ func (c *Config) Validate() error {
 	if _, err := parseDuration(c.SMS.Timeout); err != nil {
 		return fmt.Errorf("sms.timeout: %w", err)
 	}
+	for _, p := range c.SMS.AllowedPrefixes {
+		if len(p) < 2 || p[0] != '+' || strings.Trim(p[1:], "0123456789") != "" {
+			return fmt.Errorf("sms.allowed_prefixes: %q is not \"+\" followed by digits", p)
+		}
+	}
+	if err := c.Mail.validate(); err != nil {
+		return err
+	}
 	names := map[string]bool{}
 	tokens := map[string]bool{}
 	for i, s := range c.Senders {
@@ -197,8 +217,35 @@ func (c *Config) Validate() error {
 		if s.SMS && !c.smsConfigured() {
 			return fmt.Errorf("sender %q: sms needs sms.url", s.Name)
 		}
+		if s.Approval && !s.SMSUnlinked {
+			return fmt.Errorf("sender %q: approval needs sms_unlinked: true", s.Name)
+		}
+		if _, err := parseDuration(s.ApprovalTimeout); err != nil {
+			return fmt.Errorf("sender %q: approval_timeout: %w", s.Name, err)
+		}
 	}
 	return nil
+}
+
+// smsPermitted tells whether SMS may go to phone (sms.allowed_prefixes).
+func (c *Config) smsPermitted(phone string) bool {
+	if len(c.SMS.AllowedPrefixes) == 0 {
+		return true
+	}
+	for _, p := range c.SMS.AllowedPrefixes {
+		if strings.HasPrefix(phone, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *SenderConfig) approvalTimeout() time.Duration {
+	d, _ := parseDuration(s.ApprovalTimeout)
+	if d == 0 {
+		return defaultApprovalTimeout
+	}
+	return d
 }
 
 // failoverFor returns the failover delay for a message: the sender's default,

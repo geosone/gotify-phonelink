@@ -27,6 +27,7 @@ type hub struct {
 	states     map[string]*linkState
 	verifies   map[uint]*pendingVerify
 	deliveries map[string]*delivery
+	approvals  map[string]*approval
 
 	http *http.Client
 	oidc *oidcClient
@@ -34,6 +35,8 @@ type hub struct {
 
 	recheckOwner *Instance
 	recheckStop  chan struct{}
+
+	mail *mailGate // guarded by mailMu
 }
 
 type linkData struct {
@@ -87,6 +90,7 @@ func newHub() *hub {
 		states:     map[string]*linkState{},
 		verifies:   map[uint]*pendingVerify{},
 		deliveries: map[string]*delivery{},
+		approvals:  map[string]*approval{},
 		http:       c,
 		oidc:       newOIDCClient(c),
 		now:        time.Now,
@@ -157,9 +161,16 @@ func (h *hub) publicURL(cfg *Config, inst *Instance, rel string) string {
 	return strings.TrimSuffix(cfg.PublicURL, "/") + inst.basePath + rel
 }
 
-// reconcile restarts the recheck loop when the control instance or its
-// interval changed.
+// reconcile follows a change of the control instance or its configuration.
 func (h *hub) reconcile() {
+	h.reconcileRecheck()
+	_, cfg := h.control()
+	h.reconcileMail(cfg)
+}
+
+// reconcileRecheck restarts the recheck loop when the control instance or its
+// interval changed.
+func (h *hub) reconcileRecheck() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	c := h.controlLocked()
@@ -434,6 +445,9 @@ type sendRequest struct {
 	Priority    *int        `json:"priority"`
 	Failover    interface{} `json:"failover"`
 	HideContent bool        `json:"hide_content"`
+	// Who asked the sender for this message (e.g. the logged-in Matrix user
+	// ma1sd got the request from); set = no moderator approval needed
+	Requester string `json:"requester"`
 }
 
 type sendResult struct {
@@ -532,13 +546,20 @@ func (h *hub) send(ctx context.Context, cfg *Config, ctrl *Instance, s *SenderCo
 	}
 	h.mu.Unlock()
 
-	smsAllowed := s.SMS && cfg.smsConfigured() && phone != "" && priority >= s.SMSMinPriority
+	smsAllowed := s.SMS && cfg.smsConfigured() && phone != "" && priority >= s.SMSMinPriority && cfg.smsPermitted(phone)
 	text := req.Message
 	if req.Title != "" {
 		text = req.Title + "\n" + req.Message
 	}
 
 	if target == nil {
+		if phone != "" && s.SMS && s.SMSUnlinked && !cfg.smsPermitted(phone) {
+			log.Printf("gotify-phonelink: %s -> %s refused: not in sms.allowed_prefixes", s.Name, maskPhone(phone))
+			return nil, &sendError{http.StatusForbidden, "SMS to this phone number is not allowed"}
+		}
+		if smsAllowed && s.SMSUnlinked && s.Approval && req.Requester == "" {
+			return h.requestApproval(cfg, ctrl, s, phone, text)
+		}
 		if smsAllowed && s.SMSUnlinked {
 			smsCtx, cancel := context.WithTimeout(ctx, cfg.smsTimeout())
 			defer cancel()
@@ -546,7 +567,11 @@ func (h *hub) send(ctx context.Context, cfg *Config, ctrl *Instance, s *SenderCo
 				log.Printf("gotify-phonelink: SMS from %s to %s failed: %v", s.Name, maskPhone(phone), err)
 				return nil, &sendError{http.StatusBadGateway, "SMS could not be sent"}
 			}
-			log.Printf("gotify-phonelink: %s -> %s by SMS (not linked)", s.Name, maskPhone(phone))
+			if req.Requester != "" {
+				log.Printf("gotify-phonelink: %s -> %s by SMS (not linked, requested by %s)", s.Name, maskPhone(phone), req.Requester)
+			} else {
+				log.Printf("gotify-phonelink: %s -> %s by SMS (not linked)", s.Name, maskPhone(phone))
+			}
 			return &sendResult{Status: "sms"}, nil
 		}
 		return nil, &sendError{http.StatusNotFound, "the recipient has not linked this phone number to an enabled Gotify account"}

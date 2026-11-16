@@ -564,3 +564,102 @@ func TestMarkdownEscape(t *testing.T) {
 		t.Fatalf("markdownEscape = %q", got)
 	}
 }
+
+func TestApprovalSMS(t *testing.T) {
+	e := newEnv(t, false)
+	e.cfg.Senders[0].Approval = true
+	e.cfg.SMS.AllowedPrefixes = []string{"+43"}
+	if err := e.admin.ValidateAndSetConfig(e.cfg); err != nil {
+		t.Fatal(err)
+	}
+	// not a moderator: a normal user
+	e.user(t, 2, "bob", false)
+	before := len(e.msgs[1].all())
+
+	res, err := e.send(t, "ma1sd-token-0123456789", sendRequest{To: "+436769999999", Message: "Code 1"})
+	if err != nil || res.Status != "pending" {
+		t.Fatalf("send: %+v %v", res, err)
+	}
+	if n := len(e.sms.messages()); n != 0 {
+		t.Fatalf("%d SMS sent before approval", n)
+	}
+	if len(e.msgs[2].all()) != 0 {
+		t.Fatal("a non-moderator got the approval request")
+	}
+	m := e.msgs[1].all()
+	if len(m) != before+1 {
+		t.Fatal("moderator not notified")
+	}
+	click := m[len(m)-1].Extras["client::notification"].(map[string]interface{})["click"].(map[string]interface{})["url"].(string)
+	u, _ := url.Parse(click)
+	id := strings.TrimPrefix(u.Path, "/plugin/admin/custom/tok/approve/")
+
+	// a newer code replaces the pending one without a second notification
+	res2, err := e.send(t, "ma1sd-token-0123456789", sendRequest{To: "+436769999999", Message: "Code 2"})
+	if err != nil || res2.ID != res.ID || len(e.msgs[1].all()) != before+1 {
+		t.Fatalf("replace: %+v %v", res2, err)
+	}
+
+	if _, err := e.h.decide(context.Background(), id, "admin", "wrong", true); err == nil {
+		t.Fatal("decided with a wrong key")
+	}
+	if _, ok := e.h.reviewable(id, "bob", u.Query().Get("k")); ok {
+		t.Fatal("another user may review with the moderator's key")
+	}
+	v, err := e.h.decide(context.Background(), id, "admin", u.Query().Get("k"), true)
+	if err != nil || v.Decided != "approved" || v.DecidedBy != "admin" {
+		t.Fatalf("decide: %+v %v", v, err)
+	}
+	if sms := e.sms.messages(); len(sms) != 1 || sms[0].text != "Code 2" {
+		t.Fatalf("approved SMS: %+v", sms)
+	}
+	// deciding again does not send again
+	_, _ = e.h.decide(context.Background(), id, "admin", u.Query().Get("k"), true)
+	if n := len(e.sms.messages()); n != 1 {
+		t.Fatalf("%d SMS after a second approval", n)
+	}
+
+	// rejected: nothing is sent
+	res, _ = e.send(t, "ma1sd-token-0123456789", sendRequest{To: "+436768888888", Message: "Code 3"})
+	m = e.msgs[1].all()
+	u, _ = url.Parse(m[len(m)-1].Extras["client::notification"].(map[string]interface{})["click"].(map[string]interface{})["url"].(string))
+	if v, err := e.h.decide(context.Background(), res.ID, "admin", u.Query().Get("k"), false); err != nil || v.Decided != "rejected" {
+		t.Fatalf("reject: %+v %v", v, err)
+	}
+	if n := len(e.sms.messages()); n != 1 {
+		t.Fatal("SMS sent after rejection")
+	}
+
+	// a logged-in user asked (requester set): no approval needed
+	res, err = e.send(t, "ma1sd-token-0123456789", sendRequest{To: "+436767777777", Message: "Code 4", Requester: "@bob:example.org"})
+	if err != nil || res.Status != "sms" || len(e.sms.messages()) != 2 {
+		t.Fatalf("requester: %+v %v", res, err)
+	}
+
+	// country not allowed: refused at once, no moderator bothered
+	n := len(e.msgs[1].all())
+	if _, err := e.send(t, "ma1sd-token-0123456789", sendRequest{To: "+4915112345678", Message: "x"}); err == nil {
+		t.Fatal("SMS to a foreign number accepted")
+	}
+	if len(e.msgs[1].all()) != n {
+		t.Fatal("moderator notified for a refused number")
+	}
+}
+
+func TestApprovalExpires(t *testing.T) {
+	e := newEnv(t, false)
+	e.cfg.Senders[0].Approval = true
+	e.cfg.Senders[0].ApprovalTimeout = "100ms"
+	_ = e.admin.ValidateAndSetConfig(e.cfg)
+	res, err := e.send(t, "ma1sd-token-0123456789", sendRequest{To: "+436769999999", Message: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	m := e.msgs[1].all()
+	u, _ := url.Parse(m[len(m)-1].Extras["client::notification"].(map[string]interface{})["click"].(map[string]interface{})["url"].(string))
+	v, err := e.h.decide(context.Background(), res.ID, "admin", u.Query().Get("k"), true)
+	if err != nil || v.Decided != "expired" || len(e.sms.messages()) != 0 {
+		t.Fatalf("expired request delivered: %+v %v", v, err)
+	}
+}
