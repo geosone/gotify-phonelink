@@ -1,7 +1,13 @@
-# Tests, then builds the plugin for each supported Gotify release and
-# architecture. A Go plugin only loads into the exact server release it was
-# built for, so every .so is named after its Gotify version.
-# A tag v* creates a GitHub release with all builds attached.
+# Tests, then builds the plugin for every supported Gotify release and every
+# Linux architecture Gotify ships (Go plugins do not load on Windows). A Go
+# plugin only loads into the exact server release it was built for, so each
+# .so is named after its Gotify version and architecture.
+#
+# - tag v*: creates the GitHub release with all builds attached
+# - daily schedule: builds new Gotify releases that the latest plugin release
+#   has no files for yet and adds them to it
+# - manual run: builds the given Gotify release (or all) and adds it to the
+#   latest plugin release
 
 name: build
 on:
@@ -9,18 +15,21 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
+  schedule:
+    - cron: '17 5 * * *'
   workflow_dispatch:
     inputs:
       gotify:
-        description: 'Gotify release to build for (e.g. v3.1.1); empty = the list below'
+        description: 'Gotify release to build for (e.g. v3.1.1); empty = all supported'
         required: false
 
 env:
-  # Gotify releases to build for by default (newest first)
-  GOTIFY_VERSIONS: '["v3.1.1"]'
+  # oldest Gotify release the plugin builds for (Go 1.24, plugin-api v1.0.0)
+  MIN_GOTIFY: v2.6.0
 
 jobs:
   test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -35,57 +44,92 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       list: ${{ steps.v.outputs.list }}
+      any: ${{ steps.v.outputs.any }}
+      ref: ${{ steps.v.outputs.ref }}
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - id: v
         run: |
-          if [ -n "${{ github.event.inputs.gotify }}" ]; then
-            echo 'list=["${{ github.event.inputs.gotify }}"]' >> "$GITHUB_OUTPUT"
+          set -eu
+          # builds added to an existing release come from that release's tag
+          ref="$GITHUB_SHA"
+          case "${{ github.event_name }}" in schedule|workflow_dispatch)
+            ref=$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName) ;; esac
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          if [ -n "${{ github.event.inputs.gotify || '' }}" ]; then
+            list='["${{ github.event.inputs.gotify }}"]'
           else
-            echo "list=$GOTIFY_VERSIONS" >> "$GITHUB_OUTPUT"
+            all=$(gh api repos/gotify/server/releases --paginate \
+                    -q '.[] | select(.prerelease or .draft | not) | .tag_name' \
+                  | sort -V | awk -v min="$MIN_GOTIFY" '
+                      BEGIN { split(substr(min,2), m, ".") }
+                      { split(substr($0,2), v, ".");
+                        if (v[1]>m[1] || (v[1]==m[1] && (v[2]>m[2] || (v[2]==m[2] && v[3]>=m[3])))) print }')
+            if [ "${{ github.event_name }}" = schedule ]; then
+              # only releases the latest plugin release has no build for yet
+              have=$(gh release view -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null || true)
+              all=$(for v in $all; do echo "$have" | grep -q "^phonelink-$v-" || echo "$v"; done)
+            fi
+            list=$(printf '%s\n' $all | jq -R . | jq -sc 'map(select(length>0))')
           fi
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+          [ "$list" = "[]" ] && echo "any=false" >> "$GITHUB_OUTPUT" || echo "any=true" >> "$GITHUB_OUTPUT"
+          echo "Gotify releases: $list"
 
   build:
     needs: [test, versions]
+    if: always() && needs.versions.outputs.any == 'true' && (needs.test.result == 'success' || needs.test.result == 'skipped')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         gotify: ${{ fromJSON(needs.versions.outputs.list) }}
-        arch: [linux-amd64, linux-arm64, linux-arm-7]
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          ref: ${{ needs.versions.outputs.ref }}
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: Build
+      - name: Build all architectures
         run: |
-          v="${GITHUB_REF_NAME#v}"
-          case "$GITHUB_REF" in refs/tags/v*) ;; *) v="$(git describe --tags --always)";; esac
-          make build GOTIFY_VERSION=${{ matrix.gotify }} ARCHS=${{ matrix.arch }} VERSION="$v"
+          v="$(git describe --tags --always)"
+          make build GOTIFY_VERSION=${{ matrix.gotify }} VERSION="${v#v}"
+          ls -l dist/*.so
       - uses: actions/upload-artifact@v4
         with:
-          name: phonelink-${{ matrix.gotify }}-${{ matrix.arch }}
+          name: phonelink-${{ matrix.gotify }}
           path: dist/*.so
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
+    if: always() && needs.build.result != 'skipped' && github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: phonelink-*
           path: dist
           merge-multiple: true
-      - run: cd dist && sha256sum *.so > SHA256SUMS
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.so
-            dist/SHA256SUMS
-          generate_release_notes: true
+      - name: Create the release (tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cd dist && sha256sum *.so > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --generate-notes *.so SHA256SUMS
+      - name: Add new Gotify releases to the latest release
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        run: |
+          set -eu
+          tag=$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          mkdir old && gh release download "$tag" -R "$GITHUB_REPOSITORY" -p SHA256SUMS -D old || touch old/SHA256SUMS
+          cd dist
+          gh release upload "$tag" -R "$GITHUB_REPOSITORY" --clobber *.so
+          { grep -v -F -f <(ls *.so) ../old/SHA256SUMS || true; sha256sum *.so; } | sort -k2 > SHA256SUMS
+          gh release upload "$tag" -R "$GITHUB_REPOSITORY" --clobber SHA256SUMS
