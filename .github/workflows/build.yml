@@ -1,13 +1,13 @@
-# Tests, then builds the plugin for every supported Gotify release and every
+# Tests, then builds the plugin for the newest Gotify release and every
 # Linux architecture Gotify ships (Go plugins do not load on Windows). A Go
 # plugin only loads into the exact server release it was built for, so each
 # .so is named after its Gotify version and architecture.
 #
-# - tag v*: creates the GitHub release with all builds attached
-# - daily schedule: builds new Gotify releases that the latest plugin release
-#   has no files for yet and adds them to it
-# - manual run: builds the given Gotify release (or all) and adds it to the
-#   latest plugin release
+# - tag v*: creates the GitHub release with the builds for the newest Gotify
+# - daily schedule: when Gotify publishes a new release, builds it (from the
+#   latest plugin release's tag) and adds it to that plugin release
+# - manual run: builds the given Gotify release (default: the newest) and adds
+#   it to the latest plugin release
 
 name: build
 on:
@@ -20,12 +20,8 @@ on:
   workflow_dispatch:
     inputs:
       gotify:
-        description: 'Gotify release to build for (e.g. v3.1.1); empty = all supported'
+        description: 'Gotify release to build for (e.g. v3.0.0); empty = the newest'
         required: false
-
-env:
-  # oldest Gotify release the plugin builds for (first one built with Go 1.24, which the dependencies need)
-  MIN_GOTIFY: v2.6.2
 
 jobs:
   test:
@@ -60,18 +56,13 @@ jobs:
           if [ -n "${{ github.event.inputs.gotify || '' }}" ]; then
             list='["${{ github.event.inputs.gotify }}"]'
           else
-            all=$(gh api repos/gotify/server/releases --paginate \
-                    -q '.[] | select(.prerelease or .draft | not) | .tag_name' \
-                  | sort -V | awk -v min="$MIN_GOTIFY" '
-                      BEGIN { split(substr(min,2), m, ".") }
-                      { split(substr($0,2), v, ".");
-                        if (v[1]>m[1] || (v[1]==m[1] && (v[2]>m[2] || (v[2]==m[2] && v[3]>=m[3])))) print }')
+            # only the newest Gotify release; older ones stay on older plugin releases
+            latest=$(gh api repos/gotify/server/releases/latest -q .tag_name)
+            list="[\"$latest\"]"
             if [ "${{ github.event_name }}" = schedule ]; then
-              # only releases the latest plugin release has no build for yet
               have=$(gh release view -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null || true)
-              all=$(for v in $all; do echo "$have" | grep -q "^phonelink-$v-" || echo "$v"; done)
+              echo "$have" | grep -q "^phonelink-$latest-" && list='[]'
             fi
-            list=$(printf '%s\n' $all | jq -R . | jq -sc 'map(select(length>0))')
           fi
           echo "list=$list" >> "$GITHUB_OUTPUT"
           [ "$list" = "[]" ] && echo "any=false" >> "$GITHUB_OUTPUT" || echo "any=true" >> "$GITHUB_OUTPUT"

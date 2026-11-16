@@ -25,10 +25,11 @@ from the releases (a Go plugin only loads into the server it was built for),
 put it into Gotify's plugin directory (`GOTIFY_PLUGINSDIR`, default
 `data/plugins`) and restart Gotify.
 
-Builds exist for every Gotify release since v2.6.2 and every Linux
-architecture Gotify ships (amd64, 386, arm-7, arm64, and riscv64 from Gotify
-v2.9.1 on, the first built with a Go that supports plugins there). A daily job
-adds builds for new Gotify releases to the latest plugin release.
+Each plugin release is built for the newest Gotify release at that time, for
+every Linux architecture Gotify ships (amd64, 386, arm-7, arm64, riscv64). A
+daily job adds builds when Gotify publishes a new release. v0.2.0 also has
+builds for every Gotify release since v2.6.2; for another older release run
+the workflow manually with that Gotify version (or `make build`).
 
 Building yourself (needs Docker):
 
