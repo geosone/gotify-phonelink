@@ -183,6 +183,11 @@ several accounts, `401` unknown token, `400` bad request, `502` SMS failed.
 
 Pending failovers are kept in memory: a Gotify restart drops them.
 
+## Zabbix
+
+`contrib/zabbix` has a Zabbix media type (webhook) for the send endpoint, see
+[contrib/zabbix/README.md](contrib/zabbix/README.md).
+
 ## License
 
 MIT

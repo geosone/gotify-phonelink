@@ -1,0 +1,156 @@
+zabbix_export:
+  version: '7.0'
+  media_types:
+    - name: 'Gotify phonelink'
+      type: WEBHOOK
+      parameters:
+        - name: "url"
+          value: "<send endpoint, see the plugin page in Gotify>"
+        - name: "token"
+          value: "<token of the zabbix sender in the plugin configuration>"
+        - name: "send_to"
+          value: "{ALERT.SENDTO}"
+        - name: "subject"
+          value: "{ALERT.SUBJECT}"
+        - name: "message"
+          value: "{ALERT.MESSAGE}"
+        - name: "event_source"
+          value: "{EVENT.SOURCE}"
+        - name: "event_value"
+          value: "{EVENT.VALUE}"
+        - name: "event_severity"
+          value: "{EVENT.NSEVERITY}"
+        - name: "event_update_status"
+          value: "{EVENT.UPDATE.STATUS}"
+        - name: "failover"
+          value: ""
+        - name: "http_proxy"
+          value: ""
+      script: |
+        // Zabbix webhook for gotify-phonelink: sends alerts to the Gotify user who
+        // linked the phone number in the user's media ("Send to": a phone number such
+        // as +436761234567, or "user:<gotify user name>").
+        var Phonelink = {
+            // Zabbix severity (0-5) -> Gotify priority
+            priorities: [2, 3, 5, 6, 8, 10],
+
+            params: {},
+
+            setParams: function (params) {
+                ['url', 'token', 'send_to', 'message'].forEach(function (k) {
+                    if (typeof params[k] !== 'string' || params[k].trim() === '' || params[k].indexOf('{ALERT.') === 0 ||
+                        params[k].indexOf('<') === 0) {
+                        throw 'Parameter "' + k + '" is missing or was not replaced by Zabbix.';
+                    }
+                });
+                Phonelink.params = params;
+            },
+
+            isRecovery: function () {
+                var p = Phonelink.params;
+                return p.event_value === '0';
+            },
+
+            priority: function () {
+                var p = Phonelink.params;
+                if (p.event_source !== undefined && p.event_source !== '0') {
+                    return 5;
+                }
+                if (Phonelink.isRecovery() || p.event_update_status === '1') {
+                    return 3;
+                }
+                var s = parseInt(p.event_severity, 10);
+                if (isNaN(s) || s < 0 || s > 5) {
+                    return 5;
+                }
+                return Phonelink.priorities[s];
+            },
+
+            body: function () {
+                var p = Phonelink.params,
+                    to = p.send_to.trim(),
+                    body = {
+                        title: p.subject || '',
+                        message: p.message,
+                        priority: Phonelink.priority()
+                    };
+
+                if (to.indexOf('user:') === 0) {
+                    body.user = to.substring(5).trim();
+                }
+                else {
+                    body.to = to;
+                }
+                // recoveries and updates never fall back to SMS
+                if (Phonelink.isRecovery() || p.event_update_status === '1') {
+                    body.failover = 0;
+                }
+                else if (typeof p.failover === 'string' && p.failover.trim() !== '' && p.failover.indexOf('{') !== 0) {
+                    body.failover = p.failover.trim();
+                }
+                return body;
+            },
+
+            send: function () {
+                var req = new HttpRequest(),
+                    body = Phonelink.body();
+
+                if (typeof Phonelink.params.http_proxy === 'string' && Phonelink.params.http_proxy.trim() !== '') {
+                    req.setProxy(Phonelink.params.http_proxy.trim());
+                }
+                req.addHeader('Content-Type: application/json');
+                req.addHeader('Authorization: Bearer ' + Phonelink.params.token);
+
+                Zabbix.log(4, '[ Phonelink Webhook ] Sending to ' + (body.user ? 'user ' + body.user : body.to) +
+                    ', priority ' + body.priority);
+                var resp = req.post(Phonelink.params.url, JSON.stringify(body)),
+                    status = req.getStatus(),
+                    data = null;
+
+                try {
+                    data = JSON.parse(resp);
+                }
+                catch (e) {
+                    data = null;
+                }
+                if (status !== 200) {
+                    throw 'phonelink answered HTTP ' + status + ((data && data.error) ? ': ' + data.error : '');
+                }
+                return data;
+            }
+        };
+
+        try {
+            var params = JSON.parse(value);
+            Phonelink.setParams(params);
+            var result = Phonelink.send();
+            Zabbix.log(4, '[ Phonelink Webhook ] delivered by ' + (result && result.status));
+            return 'OK';
+        }
+        catch (error) {
+            Zabbix.log(3, '[ Phonelink Webhook ] Sending failed: ' + error);
+            throw 'Sending failed: ' + error;
+        }
+      timeout: 30s
+      description: "Alerts to the Gotify user who linked the phone number in the user's media (gotify-phonelink plugin), SMS failover per the plugin's zabbix sender. Send to: +<phone number> or user:<gotify user>. https://github.com/geosone/gotify-phonelink"
+      message_templates:
+        - event_source: TRIGGERS
+          operation_mode: PROBLEM
+          subject: "Problem: {EVENT.NAME}"
+          message: "{HOST.NAME}: {EVENT.NAME}\nSeverity: {EVENT.SEVERITY}\nStarted: {EVENT.DATE} {EVENT.TIME}\nOperational data: {EVENT.OPDATA}\nEvent ID: {EVENT.ID}"
+        - event_source: TRIGGERS
+          operation_mode: RECOVERY
+          subject: "Resolved in {EVENT.DURATION}: {EVENT.NAME}"
+          message: "{HOST.NAME}: {EVENT.NAME}\nResolved: {EVENT.RECOVERY.DATE} {EVENT.RECOVERY.TIME}\nEvent ID: {EVENT.ID}"
+        - event_source: TRIGGERS
+          operation_mode: UPDATE
+          subject: "Updated problem in {EVENT.AGE}: {EVENT.NAME}"
+          message: "{USER.FULLNAME} {EVENT.UPDATE.ACTION} the problem.\n{EVENT.UPDATE.MESSAGE}\nCurrent status: {EVENT.STATUS}"
+        - event_source: SERVICE
+          operation_mode: PROBLEM
+          subject: "Service \"{SERVICE.NAME}\" problem: {EVENT.NAME}"
+          message: "Service: {SERVICE.NAME}\nSeverity: {EVENT.SEVERITY}\nStarted: {EVENT.DATE} {EVENT.TIME}"
+        - event_source: SERVICE
+          operation_mode: RECOVERY
+          subject: "Service \"{SERVICE.NAME}\" resolved in {EVENT.DURATION}: {EVENT.NAME}"
+          message: "Service: {SERVICE.NAME}\nResolved: {EVENT.RECOVERY.DATE} {EVENT.RECOVERY.TIME}"

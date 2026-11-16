@@ -35,6 +35,11 @@ jobs:
       - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
       - run: go test -race ./...
+      - name: Zabbix webhook
+        run: |
+          node contrib/zabbix/test.js
+          python3 contrib/zabbix/build.py
+          git diff --exit-code contrib/zabbix/phonelink.yaml
 
   versions:
     runs-on: ubuntu-latest
